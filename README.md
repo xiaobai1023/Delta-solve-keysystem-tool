@@ -11,18 +11,6 @@ Fully-automatic Delta (Roblox executor) key renewal for Android. Pure Java + nat
 - **Auto write-back**: the fresh key is written to `Internals/Cache/license` and `Internals/Settings/delta_key` (bare key, single line) so Delta opens already verified, no manual entry
 - **Daily automation**: a 08:00 daily alarm starts a foreground service that renews silently and posts the result as a notification; re-armed automatically after reboot
 
-## Build
-
-No Gradle needed — just JDK 21 + Android build-tools 34 + android.jar:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File build.ps1
-```
-
-Tool paths are at the top of `build.ps1` (`$sdk` / `$jdk` / `$signer`); adjust them for your machine.
-
-Output: `out/base.apk` (aapt2 -> javac -> d8 -> zipalign -> v2+v3 signing).
-
 ## Getting the build tools
 
 - build-tools 34: `https://dl.google.com/android/repository/build-tools_r34-windows.zip` (extracts to a folder named `android-14`)
@@ -45,7 +33,6 @@ Output: `out/base.apk` (aapt2 -> javac -> d8 -> zipalign -> v2+v3 signing).
 │       ├── AutoService.java    # scheduled foreground service
 │       ├── AutoReceiver.java   # alarm receiver
 │       └── BootReceiver.java   # re-arm alarm after boot
-├── build.ps1           # one-shot build script
 └── LICENSE             # MIT
 ```
 
