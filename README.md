@@ -6,16 +6,52 @@ Fully-automatic Delta (Roblox executor) key renewal for Android. Pure Java + nat
 
 ## Features
 
-- **Auto HWID extraction**: reads the newest files in `/sdcard/Delta/Crashes/` (most frequent 64-hex string), falls back to `Internals/.license`
+- **Auto HWID extraction**: reads `Internals/.license` first (decodes the engine's delta-XOR chain head when the file carries one — authoritative, no phase assumption; otherwise restores the true HWID from the rotated mirror unit, cross-checking against `Crashes/` when available), falls back to the newest files in `/sdcard/Delta/Crashes/`
 - **Auto solving**: `identifier = SHA-256(HWID)` -> `POST /public/start {service:6}` -> automatic checkpoint chain (AES-CTR fingerprint, r= callback decoding, about:blank polling) -> `whitelist/6` verification
 - **Auto write-back**: the fresh key is written to `Internals/Cache/license` and `Internals/Settings/delta_key` (bare key, single line) so Delta opens already verified, no manual entry
-- **Daily automation**: a 08:00 daily alarm starts a foreground service that renews silently and posts the result as a notification; re-armed automatically after reboot
+- **Key expiry display**: queries the session (`/public/start` is idempotent -> `session/status`) for the server's real `minutesLeft` and shows the exact expiry time and remaining validity; live validity check with green/red status
+- **Configurable daily automation**: pick your own renewal time (tap the daily switch row), the alarm starts a foreground service that renews silently and posts the result as a notification; with a goAsync+wakelock inline fallback so the job still runs when the exact-alarm permission is denied (Android 12+ background FGS restriction); re-armed automatically after reboot and every time the app is opened
+
+## Build
+
+No Gradle needed — just JDK 21+ and Android build-tools 34 + android.jar. From the repo root, with `$SDK` pointing at your Android SDK (any shell, commands shown POSIX-style; on Windows use `aapt2.exe` / `d8.bat`):
+
+```bash
+BT=$SDK/build-tools/34.0.0                          # aapt2, d8, zipalign, apksigner
+AJ=$SDK/platforms/android-35/android.jar
+mkdir -p out/gen out/classes
+
+# resources + manifest -> base.apk (also generates R.java)
+"$BT/aapt2" compile --dir app/res -o out/res.zip
+"$BT/aapt2" link -o out/base.apk -I "$AJ" --manifest app/AndroidManifest.xml \
+    --min-sdk-version 26 --target-sdk-version 34 --java out/gen --auto-add-overlay out/res.zip
+
+# java -> dex
+javac --release 11 -encoding UTF-8 -cp "$AJ" -d out/classes $(find app/src out/gen -name '*.java')
+jar cf out/classes.jar -C out/classes .
+"$BT/d8" --release --lib "$AJ" --output out out/classes.jar
+
+# pack classes.dex into the apk, align, sign (any keystore works)
+(cd out && zip -u base.apk classes.dex)
+"$BT/zipalign" -f 4 out/base.apk out/aligned.apk
+"$BT/apksigner" sign --ks ~/.android/debug.keystore --ks-pass pass:android \
+    --ks-key-alias androiddebugkey --out AutoKeySolver.apk out/aligned.apk
+```
+
+No keystore yet? Create one: `keytool -genkeypair -keystore debug.keystore -alias androiddebugkey -storepass android -keypass android -dname CN=debug -validity 10000`.
+
+## Tests
+
+```bash
+python test_license_formats.py
+```
+
+Runs a Python port of `DeltaStore`'s HWID extraction against synthetic `.license` samples (current delta-XOR-head format, legacy tiling, headless mirror, garbage) — no real device data, no dependencies.
 
 ## Getting the build tools
 
-- build-tools 34: `https://dl.google.com/android/repository/build-tools_r34-windows.zip` (extracts to a folder named `android-14`)
+- build-tools 34: `https://dl.google.com/android/repository/build-tools_r34-windows.zip` (extracts to a folder named `android-14`; includes aapt2, d8, zipalign, apksigner)
 - platform android.jar: `https://dl.google.com/android/repository/platform-35_r02.zip` (take `android-35/android.jar`)
-- uber-apk-signer: `https://github.com/patrickfav/uber-apk-signer/releases` (v1.3.0)
 - JDK 21: any distribution
 
 ## Layout

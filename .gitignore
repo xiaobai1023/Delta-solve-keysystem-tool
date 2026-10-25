@@ -1,0 +1,6 @@
+# Out-of-tree build output (see README "Build")
+out/
+
+# Python
+__pycache__/
+*.pyc
