@@ -1,5 +1,8 @@
 package com.auto.keysolver;
 
+import android.content.Context;
+import android.content.SharedPreferences;
+
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -21,6 +24,8 @@ public final class DeltaStore {
     private static final File DELTA =
             new File(android.os.Environment.getExternalStorageDirectory(), "Delta");
 
+    private static final String PREF = "state";
+
     // Key write-back targets (confirmed on a real device)
     private static final String KEY_LICENSE = "Internals/Cache/license";
     private static final String KEY_DELTAKEY = "Internals/Settings/delta_key";
@@ -41,9 +46,26 @@ public final class DeltaStore {
     // HWID extraction
     // ------------------------------------------------------------------
 
-    /** .license first (the engine's own mirror, most reliable), falls back to Crashes; returns lowercase 64-hex or null. */
-    public static String extractHwid(Consumer<String> log) {
-        // 0) Delta root sanity, so a "no hit" is never silent about the cause
+    /**
+     * HWID resolution order:
+     *  1. manually entered HWID (user-asserted, survives everything);
+     *  2. live .license mirrors (freshest; every fresh read is arbitrated
+     *     against the saved value and the raw file is backed up privately);
+     *  3. the saved private copy of .license (Delta deletes the file once the
+     *     key expires — the copy keeps solving possible afterwards);
+     *  4. Crashes (plain-text hwid);
+     *  5. the saved HWID string.
+     * Fresh reads go through rememberHwid so a wrong HWID can never poison the
+     * cache. Returns lowercase 64-hex or null.
+     */
+    public static String extractHwid(Context ctx, Consumer<String> log) {
+        // 0) manually entered HWID
+        String manual = manualHwid(ctx);
+        if (manual != null) {
+            if (log != null) log.accept("[hwid] using manually entered HWID");
+            return manual;
+        }
+        // 0b) Delta root sanity, so a "no hit" is never silent about the cause
         if (!DELTA.exists()) {
             if (log != null) log.accept("[hwid] " + DELTA.getPath()
                     + " does not exist (install and open Delta once first)");
@@ -53,7 +75,7 @@ public final class DeltaStore {
         }
         // 1) .license (the HWID mirror written by the engine itself)
         for (String p : HWID_FALLBACKS) {
-            String hwid = tryMirror(new File(DELTA, p), log);
+            String hwid = tryMirror(ctx, new File(DELTA, p), log);
             if (hwid != null) {
                 if (log != null) log.accept("[hwid] from " + p);
                 return hwid;
@@ -63,21 +85,44 @@ public final class DeltaStore {
         for (File f : findLicenseFiles(DELTA, 0)) {
             if (f.equals(new File(DELTA, "Internals/.license"))
                     || f.equals(new File(DELTA, ".license"))) continue;
-            String hwid = tryMirror(f, log);
+            String hwid = tryMirror(ctx, f, log);
             if (hwid != null) {
                 if (log != null) log.accept("[hwid] from " + f.getPath());
                 return hwid;
             }
         }
-        if (log != null) log.accept("[hwid] no hit in .license, trying Crashes");
-        // 3) newest 5 files in Crashes (plain-text hwid)
+        if (log != null) log.accept("[hwid] no hit in live .license, trying saved backup");
+        // 3) the saved private copy of .license (survives Delta's expiry wipe)
+        byte[] backup = readLicenseBackup(ctx);
+        if (backup != null) {
+            boolean[] fromHead = new boolean[1];
+            String hwid = hwidFromMirror(backup, log, fromHead);
+            if (hwid != null) {
+                if (log != null) log.accept("[hwid] decoded from saved .license backup");
+                ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                        .edit().putString("last_hwid", hwid).apply();
+                return hwid;
+            }
+        }
+        if (log != null) log.accept("[hwid] no backup hit, trying Crashes");
+        // 4) newest 5 files in Crashes (plain-text hwid)
         String hw = crashesHwid(log);
-        if (hw == null && log != null) log.accept("[hwid] no hwid found on this device");
-        return hw;
+        if (hw != null) {
+            if (log != null) log.accept("[hwid] from Crashes");
+            return rememberHwid(ctx, hw, "Crashes", log);
+        }
+        // 5) the saved HWID string
+        String saved = savedHwid(ctx, log);
+        if (saved != null) {
+            if (log != null) log.accept("[hwid] using saved HWID (mirror files deleted)");
+            return saved;
+        }
+        if (log != null) log.accept("[hwid] no hwid found on this device");
+        return null;
     }
 
     /** Read + decode one mirror file, logging exactly why it failed. Returns lowercase 64-hex or null. */
-    private static String tryMirror(File f, Consumer<String> log) {
+    private static String tryMirror(Context ctx, File f, Consumer<String> log) {
         String p = f.getPath();
         if (!f.exists()) {
             if (log != null) log.accept("[hwid] " + p + ": not found");
@@ -96,12 +141,121 @@ public final class DeltaStore {
             if (log != null) log.accept("[hwid] " + p + ": empty (0 bytes)");
             return null;
         }
-        String hwid = hwidFromMirror(raw, log);
-        if (hwid == null && log != null) {
-            log.accept("[hwid] " + p + ": unrecognized (" + raw.length
+        boolean[] fromHead = new boolean[1];
+        String hwid = hwidFromMirror(raw, log, fromHead);
+        if (hwid == null) {
+            if (log != null) log.accept("[hwid] " + p + ": unrecognized (" + raw.length
                     + " bytes, head=" + headHex(raw, 24) + ")");
+            return null;
         }
-        return hwid;
+        saveLicenseBackup(ctx, raw);
+        return rememberHwid(ctx, hwid, fromHead[0] ? "delta-head" : "mirror", log);
+    }
+
+    /** Keep a private copy of the raw .license so solving survives Delta's expiry wipe. */
+    private static void saveLicenseBackup(Context ctx, byte[] raw) {
+        if (ctx == null) return;
+        try (FileOutputStream o = ctx.openFileOutput("license_backup.bin", Context.MODE_PRIVATE)) {
+            o.write(raw);
+        } catch (Exception ignore) {}
+    }
+
+    private static byte[] readLicenseBackup(Context ctx) {
+        try (FileInputStream in = ctx.openFileInput("license_backup.bin")) {
+            byte[] buf = new byte[1 << 20];
+            int n = 0, r;
+            while (n < buf.length && (r = in.read(buf, n, buf.length - n)) > 0) n += r;
+            return n > 0 ? java.util.Arrays.copyOf(buf, n) : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Manual HWID override entered by the user (null clears it). */
+    public static void setManualHwid(Context ctx, String hwid) {
+        SharedPreferences p = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE);
+        if (hwid == null) {
+            p.edit().remove("manual_hwid").apply();
+        } else {
+            p.edit().putString("manual_hwid", hwid).putString("last_hwid", hwid).apply();
+        }
+    }
+
+    static String manualHwid(Context ctx) {
+        if (ctx == null) return null;
+        return ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                .getString("manual_hwid", null);
+    }
+
+    /**
+     * Save a freshly read HWID and arbitrate against the saved one. The saved
+     * copy is what keeps solving possible after Delta deletes .license (key
+     * expiry), so a wrong overwrite must never happen: when the fresh value
+     * differs, decide with the live key (the identifier must validate); with
+     * no usable key, only an authoritative delta-XOR head decode may win.
+     */
+    private static String rememberHwid(Context ctx, String hwid, String source,
+                                       Consumer<String> log) {
+        if (ctx == null) return hwid;
+        SharedPreferences p = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE);
+        String manual = p.getString("manual_hwid", null);
+        if (manual != null) {
+            // user-asserted override: arbitration must never overwrite it
+            if (!manual.equals(hwid) && log != null) {
+                log.accept("[hwid] NOTE: fresh " + source + " hwid differs from the manual override, keeping manual");
+            }
+            return manual;
+        }
+        String saved = p.getString("last_hwid", null);
+        if (saved == null || saved.equals(hwid)) {
+            p.edit().putString("last_hwid", hwid).apply();
+            return hwid;
+        }
+        String key = p.getString("last_key", null);
+        if (key != null) {
+            boolean freshOk = quietWhitelist(hwid, key);
+            boolean savedOk = quietWhitelist(saved, key);
+            if (freshOk && !savedOk) {
+                if (log != null) log.accept("[hwid] mismatch: fresh " + source
+                        + " verified against the live key -> updating saved");
+                p.edit().putString("last_hwid", hwid).apply();
+                return hwid;
+            }
+            if (savedOk && !freshOk) {
+                if (log != null) log.accept("[hwid] mismatch: fresh from " + source
+                        + " REJECTED by the live key, keeping saved");
+                return saved;
+            }
+        }
+        if ("delta-head".equals(source)) {
+            if (log != null) log.accept("[hwid] mismatch: trusting authoritative delta-head decode");
+            p.edit().putString("last_hwid", hwid).apply();
+            return hwid;
+        }
+        if (log != null) log.accept("[hwid] mismatch: fresh from " + source
+                + " not verifiable, keeping saved");
+        return saved;
+    }
+
+    /** Live-key arbitration: identifier(hwid) + key must validate server-side. */
+    private static boolean quietWhitelist(String hwid, String key) {
+        try {
+            return Solver.whitelistValid(Solver.identifierFor(hwid), key);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** HWID saved from an earlier fresh read (survives Delta's .license wipe). */
+    static String savedHwid(Context ctx, Consumer<String> log) {
+        if (ctx == null) return null;
+        String s = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                .getString("last_hwid", null);
+        if (s != null && !HWID_RE.matcher(s).matches()) {
+            if (log != null) log.accept("[hwid] saved HWID malformed, ignored");
+            return null;
+        }
+        return s;
     }
 
     private static String headHex(byte[] b, int n) {
@@ -144,11 +298,12 @@ public final class DeltaStore {
      *      occurrence counts cannot decide the phase (N vs N-1), so hand the
      *      unit to resolveMirror (Crashes cross-check, else fixed de-rotation).
      */
-    private static String hwidFromMirror(byte[] raw, Consumer<String> log) {
+    private static String hwidFromMirror(byte[] raw, Consumer<String> log, boolean[] fromHead) {
         if (raw == null || raw.length == 0) return null;
         String head = deltaHeadHwid(raw);
         if (head != null) {
             if (log != null) log.accept("[hwid] delta-XOR head decoded");
+            fromHead[0] = true;
             return head;
         }
         String text = new String(raw, StandardCharsets.UTF_8);

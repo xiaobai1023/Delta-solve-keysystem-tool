@@ -2,6 +2,7 @@ package com.auto.keysolver;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.TimePickerDialog;
 import android.content.Intent;
 import android.content.pm.PackageManager;
@@ -14,6 +15,7 @@ import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Switch;
@@ -53,8 +55,8 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         // Self-heal: swiping the app away (force-stop) cancels all alarms on
-        // some ROMs; re-arm the alarm every time the app is opened.
-        if (Scheduler.isDaily(this)) {
+        // some ROMs; re-arm the alarms every time the app is opened.
+        if (Scheduler.automationEnabled(this)) {
             Scheduler.scheduleNextDaily(this);
         }
         refreshStatus();
@@ -96,10 +98,25 @@ public class MainActivity extends Activity {
         dailySwitch.setOnClickListener(v -> showTimePicker());
         root.addView(dailySwitch);
 
+        Switch expirySwitch = new Switch(this);
+        expirySwitch.setText("Renew automatically when the key expires");
+        expirySwitch.setChecked(Scheduler.isAutoExpiry(this));
+        expirySwitch.setOnCheckedChangeListener((b, on) -> {
+            Scheduler.setAutoExpiry(this, on);
+            toast(on ? "Expiry auto-renewal enabled" : "Expiry auto-renewal disabled");
+        });
+        root.addView(expirySwitch);
+
         Button solve = new Button(this);
         solve.setText("SOLVE NOW");
         solve.setOnClickListener(v -> startSolve());
         root.addView(solve, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        Button hwidBtn = new Button(this);
+        hwidBtn.setText("SET HWID MANUALLY");
+        hwidBtn.setOnClickListener(v -> showManualHwidDialog());
+        root.addView(hwidBtn, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         logView = new TextView(this);
@@ -118,6 +135,38 @@ public class MainActivity extends Activity {
         return String.format(Locale.US, "Daily auto-renew at %02d:%02d (tap to change)", t[0], t[1]);
     }
 
+    /**
+     * Manual HWID override: saved as-is and used for the identifier until
+     * cleared (empty input). Survives Delta deleting .license on key expiry.
+     */
+    private void showManualHwidDialog() {
+        EditText et = new EditText(this);
+        et.setSingleLine(true);
+        et.setHint("64 hex chars (leave empty to clear)");
+        String cur = DeltaStore.manualHwid(this);
+        et.setText(cur == null ? "" : cur);
+        new AlertDialog.Builder(this)
+                .setTitle("Manual HWID override")
+                .setMessage("Used as-is for the key identifier. Leave empty to go back to auto-detection.")
+                .setView(et)
+                .setPositiveButton("Save", (d, w) -> {
+                    String v = et.getText().toString().trim()
+                            .toLowerCase(Locale.US).replaceAll("[^0-9a-f]", "");
+                    if (v.isEmpty()) {
+                        DeltaStore.setManualHwid(this, null);
+                        toast("Manual HWID cleared");
+                    } else if (v.length() == 64) {
+                        DeltaStore.setManualHwid(this, v);
+                        toast("Manual HWID saved");
+                    } else {
+                        toast("Invalid HWID: need exactly 64 hex chars");
+                    }
+                    refreshStatus();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
     private void showTimePicker() {
         int[] t = Scheduler.getTime(this);
         TimePickerDialog dlg = new TimePickerDialog(this, (TimePicker tp, int h, int m) -> {
@@ -133,9 +182,16 @@ public class MainActivity extends Activity {
         boolean ok = hasStorage();
         sb.append("File access: ").append(ok ? "granted" : "denied").append('\n');
         if (ok) {
-            String hwid = DeltaStore.extractHwid(null);
+            sb.append("Battery opt: ")
+                    .append(((android.os.PowerManager) getSystemService(POWER_SERVICE))
+                            .isIgnoringBatteryOptimizations(getPackageName())
+                            ? "ignored (auto-renew reliable)"
+                            : "ACTIVE (may block auto-renew, allow it when prompted)").append('\n');
+            String hwid = DeltaStore.extractHwid(this, null);
             if (hwid != null) {
-                sb.append("HWID: ").append(hwid).append('\n');
+                sb.append("HWID: ").append(hwid)
+                        .append(DeltaStore.manualHwid(this) != null ? " (manual)" : "")
+                        .append('\n');
                 try {
                     sb.append("identifier: ").append(Solver.identifierFor(hwid)).append('\n');
                 } catch (Exception ignore) {}
@@ -192,7 +248,7 @@ public class MainActivity extends Activity {
             boolean valid = false;
             long minutesLeft = -1;
             try {
-                String hwid = DeltaStore.extractHwid(null);
+                String hwid = DeltaStore.extractHwid(this, null);
                 if (hwid != null) {
                     Solver.SessionInfo si = Solver.sessionStatus(hwid, s -> { });
                     if (si != null && key.equals(si.key)) {
@@ -203,7 +259,7 @@ public class MainActivity extends Activity {
             } catch (Exception e) {
                 // Session query failed (rate limited / offline) -> light whitelist check
                 try {
-                    String hwid = DeltaStore.extractHwid(null);
+                    String hwid = DeltaStore.extractHwid(this, null);
                     valid = hwid != null
                             && Solver.whitelistValid(Solver.identifierFor(hwid), key);
                 } catch (Exception ignore) {}
@@ -236,6 +292,7 @@ public class MainActivity extends Activity {
 
     private void ensurePermissions() {
         if (hasStorage()) {
+            askIgnoreBatteryOptimizations();
             if (Build.VERSION.SDK_INT >= 33
                     && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
                     != PackageManager.PERMISSION_GRANTED) {
@@ -259,6 +316,19 @@ public class MainActivity extends Activity {
                     Manifest.permission.WRITE_EXTERNAL_STORAGE,
                     Manifest.permission.READ_EXTERNAL_STORAGE}, 2);
         }
+    }
+
+    /**
+     * Battery-optimization exemption: OEM battery managers freeze apps and drop
+     * their alarms otherwise — the main practical killer of scheduled renewals.
+     */
+    private void askIgnoreBatteryOptimizations() {
+        android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+        if (pm.isIgnoringBatteryOptimizations(getPackageName())) return;
+        try {
+            startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:" + getPackageName())));
+        } catch (Exception ignore) {}
     }
 
     private boolean hasStorage() {

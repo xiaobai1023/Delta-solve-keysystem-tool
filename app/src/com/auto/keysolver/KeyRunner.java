@@ -20,7 +20,7 @@ public final class KeyRunner {
 
         // 1) HWID
         log.log("[1/4] Reading device HWID ...");
-        String hwid = DeltaStore.extractHwid(s -> log.log(s));
+        String hwid = DeltaStore.extractHwid(ctx, s -> log.log(s));
         if (hwid == null) {
             throw new Exception("No HWID found (check file-access permission / has Delta ever launched?)");
         }
@@ -66,16 +66,18 @@ public final class KeyRunner {
 
     public static void saveLast(Context ctx, String key) {
         SharedPreferences p = ctx.getSharedPreferences("state", Context.MODE_PRIVATE);
+        long expiry = System.currentTimeMillis() + 24L * 3600_000L; // 24h key period fallback
         p.edit()
                 .putString("last_key", key)
                 .putLong("last_time", System.currentTimeMillis())
                 .apply();
         // Also fetch the session's real remaining minutes (idempotent start + status.minutesLeft)
         try {
-            String hwid = DeltaStore.extractHwid(null);
+            String hwid = DeltaStore.extractHwid(ctx, null);
             if (hwid != null) {
                 Solver.SessionInfo si = Solver.sessionStatus(hwid, s -> { });
                 if (si != null && key.equals(si.key) && si.minutesLeft >= 0) {
+                    expiry = System.currentTimeMillis() + si.minutesLeft * 60_000L;
                     p.edit()
                             .putLong("key_minutes_left", si.minutesLeft)
                             .putLong("key_status_time", System.currentTimeMillis())
@@ -83,6 +85,8 @@ public final class KeyRunner {
                 }
             }
         } catch (Exception ignore) {}
+        // Drives the expiry-based auto renewal (Scheduler.nextExpiryMillis)
+        p.edit().putLong("expiry_at", expiry).apply();
     }
 
     public static String lastKey(Context ctx) {

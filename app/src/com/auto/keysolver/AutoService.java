@@ -7,8 +7,14 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.os.IBinder;
+import android.os.PowerManager;
 
-/** Daily renewal foreground service: alarm -> solve -> notify the result -> stop. */
+/**
+ * Renewal worker started by AutoReceiver from the alarm. Started with a plain
+ * startService() (no Android 12+ startForeground contract), so a vetoed
+ * foreground promotion is caught and the solve simply runs as a plain service
+ * under the wakelock.
+ */
 public class AutoService extends Service {
 
     private static final String CHANNEL_ID = "solve";
@@ -30,21 +36,33 @@ public class AutoService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        startForeground(NOTIF_ID, buildNotification("Auto-renewing Delta key ..."));
+        try {
+            startForeground(NOTIF_ID, buildNotification("Auto-renewing Delta key ..."));
+        } catch (Exception e) {
+            // Foreground promotion vetoed (Android 12+ background restriction):
+            // keep solving as a plain service under the wakelock below
+        }
         new Thread(this::solve, "auto-solve").start();
         return START_NOT_STICKY;
     }
 
     private void solve() {
+        PowerManager.WakeLock wl = ((PowerManager) getSystemService(Context.POWER_SERVICE))
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "autokeysolver:solve");
+        wl.acquire(180_000L);
         String result;
         try {
             String key = KeyRunner.run(this, s -> { });
             result = "Solved: " + key;
         } catch (Exception e) {
             result = "Failed: " + e.getMessage();
+        } finally {
+            wl.release();
         }
-        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-        nm.notify(2001, buildNotification(result));
+        try {
+            NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            nm.notify(2001, buildNotification(result));
+        } catch (Exception ignore) {}
         stopForeground(true);
         stopSelf();
     }
